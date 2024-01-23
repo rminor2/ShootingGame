@@ -15,6 +15,13 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/ryanminor/GO_Practice/pkg/database"
+	"github.com/ryanminor/GO_Practice/pkg/player"
+)
+
+var (
+	leaderboardMutex sync.Mutex
+	leaderboard      map[string]player.Player
 )
 
 // Function to connect to the database
@@ -47,30 +54,37 @@ func connectToDatabase() (*sql.DB, error) {
 }
 
 // Player struct represents a player in the game with a username, age, and score.
-type Player struct {
-	UserName string `json:"userName"`
-	Age      int    `json:"age"`
-	Score    int    `json:"score"`
+type GameRequest struct {
+	Players   []player.Player `json:"players"`
+	NumRounds int             `json:"numRounds"`
 }
 
 // LeaderboardManager struct to manage the leaderboard
 type LeaderboardManager struct {
-	scores map[string]Player
+	scores map[string]player.Player
 	mutex  sync.Mutex
 }
 
 // NewLeaderboardManager creates and initializes a new LeaderboardManager
 func NewLeaderboardManager() *LeaderboardManager {
 	return &LeaderboardManager{
-		scores: make(map[string]Player),
+		scores: make(map[string]player.Player),
 	}
 }
 
 // UpdateLeaderboard updates the leaderboard with a slice of players
-func (lm *LeaderboardManager) UpdateLeaderboard(db *sql.DB, players []Player) error {
-	for _, player := range players {
-		// Example SQL query - adjust according to your database schema
-		_, err := db.Exec("INSERT INTO leaderboard (username, score) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET score = EXCLUDED.score", player.UserName, player.Score)
+// UpdateLeaderboard updates the leaderboard with a slice of players
+// UpdateLeaderboard updates the leaderboard with a slice of players
+func (lm *LeaderboardManager) UpdateLeaderboard(db *sql.DB, players []player.Player) error {
+	lm.mutex.Lock()
+	defer lm.mutex.Unlock()
+
+	for _, p := range players {
+		// Update in-memory leaderboard
+		lm.scores[p.UserName] = p
+
+		// Update database leaderboard
+		_, err := db.Exec("INSERT INTO leaderboard (username, score) VALUES ($1, $2) ON CONFLICT (username) DO UPDATE SET score = EXCLUDED.score", p.UserName, p.Score)
 		if err != nil {
 			return err
 		}
@@ -79,32 +93,19 @@ func (lm *LeaderboardManager) UpdateLeaderboard(db *sql.DB, players []Player) er
 }
 
 // GetLeaderboard returns the current state of the leaderboard
-func (lm *LeaderboardManager) GetLeaderboard() []Player {
+func (lm *LeaderboardManager) GetLeaderboard() []player.Player {
 	lm.mutex.Lock()
 	defer lm.mutex.Unlock()
 
-	var leaderboard []Player
-	for _, player := range lm.scores {
-		leaderboard = append(leaderboard, player)
+	var leaderboard []player.Player
+	for _, p := range lm.scores {
+		leaderboard = append(leaderboard, p)
 	}
 	sort.Slice(leaderboard, func(i, j int) bool {
 		return leaderboard[i].Score > leaderboard[j].Score
 	})
 	return leaderboard
 }
-
-type GameRequest struct {
-	Players   []Player `json:"players"`
-	NumRounds int      `json:"numRounds"`
-}
-
-var (
-	// Global storage for the game state - consider using a database or session management in a real application
-	currentGame        GameRequest
-	leaderboard        = make(map[string]Player)
-	leaderboardMutex   sync.Mutex
-	leaderboardManager *LeaderboardManager
-)
 
 // takeShot simulates a shooting action in the game, randomly returning 0 (miss) or 3 (hit).
 func takeShot() int {
@@ -122,7 +123,7 @@ func clearBuffer() {
 }
 
 // playGame is a goroutine function that handles an individual game
-func playGame(gameReq GameRequest, doneChan chan<- []Player) {
+func playGame(gameReq GameRequest, doneChan chan<- []player.Player) {
 	players := playRound(gameReq)
 	calculateScores(players)
 	doneChan <- players
@@ -131,8 +132,8 @@ func playGame(gameReq GameRequest, doneChan chan<- []Player) {
 // initializePlayers sets up the initial state of each player.
 // It takes the number of players as input, and prompts for each player's name and age.
 // Returns a slice of initialized Player structs.
-func initializePlayers(numPlayers int) []Player {
-	players := make([]Player, numPlayers)
+func initializePlayers(numPlayers int) []player.Player {
+	players := make([]player.Player, numPlayers)
 	reader := bufio.NewReader(os.Stdin)
 
 	for i := 0; i < numPlayers; i++ {
@@ -160,7 +161,7 @@ func initializePlayers(numPlayers int) []Player {
 			break
 		}
 
-		players[i] = Player{UserName: name, Age: age}
+		players[i] = player.Player{UserName: name, Age: age}
 	}
 
 	return players
@@ -170,7 +171,7 @@ func initializePlayers(numPlayers int) []Player {
 // It loops through the specified number of rounds, and within each round,
 // it allows each player to take shots and updates their scores.
 // Returns the updated slice of players with their final scores.
-func playRound(gameReq GameRequest) []Player {
+func playRound(gameReq GameRequest) []player.Player {
 	reader := bufio.NewReader(os.Stdin)
 
 	for round := 1; round <= gameReq.NumRounds; round++ {
@@ -196,7 +197,7 @@ func playRound(gameReq GameRequest) []Player {
 }
 
 // calculateScores sorts the players based on their scores in descending order.
-func calculateScores(players []Player) {
+func calculateScores(players []player.Player) {
 	// Add logic to calculate and update player scores
 	// For now, it's just the sum of shots
 
@@ -206,14 +207,15 @@ func calculateScores(players []Player) {
 }
 
 // displayScores prints the leaderboard showing the players and their scores.
-func displayScores(players []Player) {
+func displayScores(players []player.Player) {
 	fmt.Println("\nLeader Board: ")
 	for i, player := range players {
 		fmt.Printf("\nPlayer %d: Name: %s Age: %d Total Score: %d \n", i+1, player.UserName, player.Age, player.Score)
 	}
 }
 
-func startGameHandler(w http.ResponseWriter, r *http.Request) {
+func startGameHandler(w http.ResponseWriter, r *http.Request, db *sql.DB, lm *LeaderboardManager) {
+
 	if r.Method != "POST" {
 		http.Error(w, "Only POST requests are allowed", http.StatusMethodNotAllowed)
 		return
@@ -225,23 +227,29 @@ func startGameHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doneChan := make(chan []Player)
-	go playGame(gameReq, doneChan)
+	players := playRound(gameReq)
+	for _, p := range players {
+		if err := player.UpdatePlayer(db, p); err != nil {
+			http.Error(w, "Error updating player", http.StatusInternalServerError)
+			return
+		}
+	}
 
-	fmt.Fprintf(w, "Game started")
+	if err := lm.UpdateLeaderboard(db, players); err != nil {
+		http.Error(w, "Error updating leaderboard", http.StatusInternalServerError)
+		return
+	}
 
-	go func() {
-		players := <-doneChan
-		leaderboardManager.UpdateLeaderboard(players)
-	}()
+	fmt.Fprintf(w, "Game started and data recorded")
 }
 
-func updateLeaderboard(players []Player) {
+func updateLeaderboard(players []player.Player) {
 	leaderboardMutex.Lock()
 	defer leaderboardMutex.Unlock()
 
 	for _, player := range players {
 		// Assuming UserName is unique
+
 		leaderboard[player.UserName] = player
 	}
 }
@@ -251,21 +259,30 @@ func updateLeaderboard(players []Player) {
 // and orchestrates the flow of the game.
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	db, err := connectToDatabase()
+
+	db, err := database.ConnectToDatabase()
 	if err != nil {
 		log.Fatalf("Could not connect to the database: %v", err)
 	}
 	defer db.Close()
 
-	leaderboardManager = NewLeaderboardManager()
+	lm := NewLeaderboardManager()
 
-	http.HandleFunc("/start-game", startGameHandler)
+	http.HandleFunc("/start-game", func(w http.ResponseWriter, r *http.Request) {
+		startGameHandler(w, r, db, lm)
+	})
+
 	http.HandleFunc("/leaderboard", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "Only GET requests are allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		json.NewEncoder(w).Encode(leaderboardManager.GetLeaderboard())
+		leaderboard, err := player.GetLeaderboard(db)
+		if err != nil {
+			http.Error(w, "Error fetching leaderboard", http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(leaderboard)
 	})
 
 	fmt.Println("Server is running on http://localhost:8080")
